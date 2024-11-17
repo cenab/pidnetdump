@@ -1,33 +1,20 @@
 import sys
 import threading
 import time
-import psutil
-from scapy.all import sniff, IP, IPv6, TCP, UDP
-from datetime import datetime
 import argparse
+import logging
+import subprocess
+from datetime import datetime
 from .utils import is_root, get_process_name
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Real-time network packet monitoring for a specific PID.'
+        description='Real-time network monitoring for a specific PID using nettop.'
     )
     parser.add_argument(
         'pid',
         type=int,
         help='Process ID to monitor'
-    )
-    parser.add_argument(
-        '-i', '--interface',
-        type=str,
-        default=None,
-        help='Network interface to listen on (default: all interfaces)'
-    )
-    parser.add_argument(
-        '-p', '--protocol',
-        type=str,
-        choices=['tcp', 'udp', 'all'],
-        default='all',
-        help='Protocol to filter (default: all)'
     )
     parser.add_argument(
         '-l', '--logfile',
@@ -36,166 +23,142 @@ def parse_arguments():
         help='Log output to a file'
     )
     parser.add_argument(
-        '-v', '--verbose',
+        '--debug',
         action='store_true',
-        help='Enable verbose output'
+        help='Enable debug logging'
+    )
+    parser.add_argument(
+        '--interval',
+        type=int,
+        default=1,
+        help='Update interval in seconds (default: 1)'
     )
     return parser.parse_args()
 
-class ConnectionMonitor(threading.Thread):
-    def __init__(self, pid, update_interval=1):
-        super().__init__()
+def setup_logging(debug=False):
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+class NetTopMonitor(threading.Thread):
+    def __init__(self, pid, interval=1, logfile=None):
+        super().__init__(name='NetTopMonitor')
         self.pid = pid
-        self.update_interval = update_interval
-        self.connections = set()
-        self.running = True
-        self.lock = threading.Lock()
-
-    def run(self):
-        while self.running:
-            self.update_connections()
-            time.sleep(self.update_interval)
-
-    def update_connections(self):
-        with self.lock:
-            new_connections = set()
-            try:
-                proc = psutil.Process(self.pid)
-                conns = proc.connections(kind='inet')
-                for conn in conns:
-                    if conn.status == psutil.CONN_ESTABLISHED:
-                        laddr = (conn.laddr.ip, conn.laddr.port)
-                        raddr = (conn.raddr.ip, conn.raddr.port) if conn.raddr else None
-                        new_connections.add((laddr, raddr))
-            except psutil.NoSuchProcess:
-                print(f"Process with PID {self.pid} does not exist.")
-                self.running = False
-                return
-            except psutil.AccessDenied:
-                print(f"Access denied to process with PID {self.pid}.")
-                self.running = False
-                return
-            except Exception as e:
-                print(f"Error retrieving connections: {e}")
-                self.running = False
-                return
-            self.connections = new_connections
-
-    def stop(self):
-        self.running = False
-
-class PacketSniffer(threading.Thread):
-    def __init__(self, connection_monitor, iface=None, protocol='all', logfile=None, verbose=False):
-        super().__init__()
-        self.connection_monitor = connection_monitor
-        self.iface = iface
-        self.protocol = protocol
+        self.interval = interval
         self.logfile = logfile
-        self.verbose = verbose
         self.running = True
 
     def run(self):
-        if self.protocol == 'tcp':
-            filter_proto = 'tcp'
-        elif self.protocol == 'udp':
-            filter_proto = 'udp'
-        else:
-            filter_proto = 'tcp or udp'
+        logging.debug(f"Starting NetTopMonitor for PID {self.pid}")
+        cmd = [
+            'nettop', '-P', '-p', str(self.pid), '-L', '0',
+            '-s', str(self.interval), '-x'
+        ]
+        logging.debug(f"Running command: {' '.join(cmd)}")
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        sniff_kwargs = {
-            'prn': self.process_packet,
-            'store': False,
-            'stop_filter': self.stop_sniffing,
-            'filter': filter_proto,
-        }
-        if self.iface:
-            sniff_kwargs['iface'] = self.iface
+        try:
+            header = process.stdout.readline()
+            logging.debug(f"Header: {header.strip()}")
+            while self.running:
+                output = process.stdout.readline()
+                if output:
+                    self.process_output(output.strip())
+                else:
+                    time.sleep(self.interval)
+        except Exception as e:
+            logging.exception(f"Error in NetTopMonitor: {e}")
+        finally:
+            process.terminate()
+            logging.debug("NetTopMonitor stopped.")
 
-        sniff(**sniff_kwargs)
-
-    def process_packet(self, packet):
-        if not packet.haslayer(IP) and not packet.haslayer(IPv6):
-            return
-
+    def process_output(self, output):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-        src_ip = packet[IP].src if packet.haslayer(IP) else packet[IPv6].src
-        dst_ip = packet[IP].dst if packet.haslayer(IP) else packet[IPv6].dst
-        src_port = None
-        dst_port = None
+        logging.debug(f"Raw output: {output}")
+        try:
+            columns = output.split(',')
+            if len(columns) >= 20:
+                # Adjust indices based on the columns output by nettop
+                nettop_time = columns[0]
+                proc_name_pid = columns[1]  # This includes process name and PID
+                interface = columns[2]
+                state = columns[3]
+                bytes_in = columns[4]
+                bytes_out = columns[5]
+                rx_dupe = columns[6]
+                rx_ooo = columns[7]
+                re_tx = columns[8]
+                rtt_avg = columns[9]
+                rcvsize = columns[10]
+                tx_win = columns[11]
+                tc_class = columns[12]
+                tc_mgt = columns[13]
+                cc_algo = columns[14]
+                P = columns[15]
+                C = columns[16]
+                R = columns[17]
+                W = columns[18]
+                arch = columns[19]
 
-        if packet.haslayer(TCP):
-            src_port = packet[TCP].sport
-            dst_port = packet[TCP].dport
-        elif packet.haslayer(UDP):
-            src_port = packet[UDP].sport
-            dst_port = packet[UDP].dport
-        else:
-            return  # Skip non-TCP/UDP packets
-
-        with self.connection_monitor.lock:
-            for conn in self.connection_monitor.connections:
-                laddr, raddr = conn
-                # Check if packet matches local or remote address
-                if ((src_ip, src_port) == laddr or (dst_ip, dst_port) == laddr or
-                    (src_ip, src_port) == raddr or (dst_ip, dst_port) == raddr):
-                    self.display_packet(packet, timestamp)
-                    break
-
-    def display_packet(self, packet, timestamp):
-        output = f"[{timestamp}] {packet.summary()}"
-        if self.verbose:
-            output += f"\n{packet.show(dump=True)}"
-        print(output)
-        if self.logfile:
-            with open(self.logfile, 'a') as f:
-                f.write(output + '\n')
-
-    def stop_sniffing(self, packet):
-        return not self.running
+                output_line = (
+                    f"[{timestamp}] Process: {proc_name_pid}, "
+                    f"Interface: {interface}, State: {state}, "
+                    f"Bytes In: {bytes_in}, Bytes Out: {bytes_out}, "
+                    f"RX Dup: {rx_dupe}, RX OOO: {rx_ooo}, Re-Tx: {re_tx}, "
+                    f"RTT Avg: {rtt_avg}, RcvSize: {rcvsize}, TxWin: {tx_win}"
+                )
+                print(output_line)
+                if self.logfile:
+                    with open(self.logfile, 'a') as f:
+                        f.write(output_line + '\n')
+            else:
+                logging.debug("Output does not have enough columns. Skipping.")
+        except Exception as e:
+            logging.exception(f"Error processing output: {e}")
 
     def stop(self):
+        logging.debug("Stopping NetTopMonitor...")
         self.running = False
 
 def main():
+    args = parse_arguments()
+    setup_logging(debug=args.debug)
+
     if not is_root():
-        print("This script must be run as root.")
+        logging.error("This script must be run as root.")
         sys.exit(1)
 
-    args = parse_arguments()
-
     try:
+        import psutil
         proc = psutil.Process(args.pid)
         proc_name = get_process_name(proc)
     except psutil.NoSuchProcess:
-        print(f"Process with PID {args.pid} does not exist.")
+        logging.error(f"Process with PID {args.pid} does not exist.")
         sys.exit(1)
     except psutil.AccessDenied:
-        print(f"Access denied to process with PID {args.pid}.")
+        logging.error(f"Access denied to process with PID {args.pid}.")
+        sys.exit(1)
+    except Exception as e:
+        logging.exception(f"Error accessing process with PID {args.pid}: {e}")
         sys.exit(1)
 
-    print(f"Monitoring network packets for PID {args.pid} ({proc_name})...")
+    logging.info(f"Monitoring network activity for PID {args.pid} ({proc_name}) using nettop...")
 
-    connection_monitor = ConnectionMonitor(args.pid)
-    packet_sniffer = PacketSniffer(
-        connection_monitor,
-        iface=args.interface,
-        protocol=args.protocol,
-        logfile=args.logfile,
-        verbose=args.verbose
-    )
+    nettop_monitor = NetTopMonitor(args.pid, interval=args.interval, logfile=args.logfile)
 
     try:
-        connection_monitor.start()
-        packet_sniffer.start()
-        while connection_monitor.running and packet_sniffer.running:
+        nettop_monitor.start()
+        while nettop_monitor.running:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping the tool...")
+        logging.info("Keyboard interrupt received. Stopping the tool...")
     finally:
-        connection_monitor.stop()
-        packet_sniffer.stop()
-        connection_monitor.join()
-        packet_sniffer.join()
+        nettop_monitor.stop()
+        nettop_monitor.join()
+        logging.info("Tool stopped.")
 
 if __name__ == '__main__':
     main()

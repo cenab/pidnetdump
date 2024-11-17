@@ -9,16 +9,18 @@ setup(
     url='https://github.com/cenab/pidnetdump',
     packages=find_packages(),
     install_requires=[
-        'psutil>=5.8.0',
-        'scapy>=2.4.5',
+        'psutil>=5.9.5',
+        'scapy>=2.5.0',
+        'setuptools>=65.5.0',
     ],
+    python_requires='>=3.11',
     entry_points={
         'console_scripts': [
             'pidnetdump=pidnetdump.pidnetdump:main',
         ],
     },
     classifiers=[
-        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.11',
         'Operating System :: OS Independent',
     ],
 )
