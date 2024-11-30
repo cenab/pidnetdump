@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 import time
@@ -5,22 +6,20 @@ import argparse
 import logging
 import subprocess
 from datetime import datetime
-from .utils import is_root, get_process_name
+import select
+import re
+
+def is_root():
+    return os.geteuid() == 0
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Real-time network monitoring for a specific PID using nettop.'
+        description='Real-time network monitoring for a specific PID using tcpdump.'
     )
     parser.add_argument(
         'pid',
         type=int,
         help='Process ID to monitor'
-    )
-    parser.add_argument(
-        '-l', '--logfile',
-        type=str,
-        default=None,
-        help='Log output to a file'
     )
     parser.add_argument(
         '--debug',
@@ -30,97 +29,149 @@ def parse_arguments():
     parser.add_argument(
         '--interval',
         type=int,
-        default=1,
-        help='Update interval in seconds (default: 1)'
+        default=5,
+        help='Update interval in seconds (default: 5)'
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
 def setup_logging(debug=False):
     log_level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        datefmt='%Y-%m-%d %H:%M:%S',
+        force=True
     )
 
 class NetTopMonitor(threading.Thread):
-    def __init__(self, pid, interval=1, logfile=None):
+    def __init__(self, pid, interval=5):
         super().__init__(name='NetTopMonitor')
         self.pid = pid
         self.interval = interval
-        self.logfile = logfile
         self.running = True
+        self.active_ports = set()
+        self.tcpdump_proc = None
+
+    def get_active_ports(self):
+        active_ports = set()
+        try:
+            # Use nettop with -x for raw output
+            nettop_cmd = [
+                'nettop',
+                '-P',
+                '-L', '1',
+                '-x',
+                '-p', str(self.pid)
+            ]
+            result = subprocess.run(nettop_cmd, capture_output=True, text=True)
+            output = result.stdout
+            logging.debug(f"Raw nettop output:\n{output}")
+
+            # Skip header lines
+            lines = output.strip().split('\n')
+            for line in lines:
+                logging.debug(f"Parsing line: {line}")
+                # Adjust the regex to match the nettop output
+                # Example line:
+                # TCP 4 192.168.1.98:64405<->2a03:2880:f201:c6:face:b00c:0:7260:443 en1 Established
+                match = re.search(r'\S+\s+\S+\s+([\d\.:]+):(\d+)<->([\d\.:]+):(\d+)', line)
+                if match:
+                    local_ip = match.group(1)
+                    local_port = int(match.group(2))
+                    remote_ip = match.group(3)
+                    remote_port = int(match.group(4))
+                    active_ports.add(local_port)
+                    active_ports.add(remote_port)
+                    logging.debug(f"Found ports: {local_port}, {remote_port}")
+                else:
+                    logging.debug("No match found for line")
+
+            logging.debug(f"Active ports from nettop: {active_ports}")
+        except Exception as e:
+            logging.error(f"Error retrieving active ports: {e}")
+        return active_ports
 
     def run(self):
         logging.debug(f"Starting NetTopMonitor for PID {self.pid}")
-        cmd = [
-            'nettop', '-P', '-p', str(self.pid), '-L', '0',
-            '-s', str(self.interval), '-x'
-        ]
-        logging.debug(f"Running command: {' '.join(cmd)}")
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        try:
-            header = process.stdout.readline()
-            logging.debug(f"Header: {header.strip()}")
-            while self.running:
-                output = process.stdout.readline()
-                if output:
-                    self.process_output(output.strip())
-                else:
+        last_update_time = 0
+
+        while self.running:
+            now = time.time()
+            if now - last_update_time >= self.interval:
+                last_update_time = now
+                current_ports = self.get_active_ports()
+
+                if not current_ports:
+                    logging.info("No active network connections found for the process")
                     time.sleep(self.interval)
-        except Exception as e:
-            logging.exception(f"Error in NetTopMonitor: {e}")
-        finally:
-            process.terminate()
-            logging.debug("NetTopMonitor stopped.")
+                    continue
 
-    def process_output(self, output):
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-        logging.debug(f"Raw output: {output}")
-        try:
-            columns = output.split(',')
-            if len(columns) >= 20:
-                # Adjust indices based on the columns output by nettop
-                nettop_time = columns[0]
-                proc_name_pid = columns[1]  # This includes process name and PID
-                interface = columns[2]
-                state = columns[3]
-                bytes_in = columns[4]
-                bytes_out = columns[5]
-                rx_dupe = columns[6]
-                rx_ooo = columns[7]
-                re_tx = columns[8]
-                rtt_avg = columns[9]
-                rcvsize = columns[10]
-                tx_win = columns[11]
-                tc_class = columns[12]
-                tc_mgt = columns[13]
-                cc_algo = columns[14]
-                P = columns[15]
-                C = columns[16]
-                R = columns[17]
-                W = columns[18]
-                arch = columns[19]
+                if current_ports != self.active_ports:
+                    self.active_ports = current_ports
+                    # Restart tcpdump with new filter
+                    if self.tcpdump_proc:
+                        logging.debug("Ports have changed, restarting tcpdump")
+                        self.tcpdump_proc.terminate()
+                        try:
+                            self.tcpdump_proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self.tcpdump_proc.kill()
+                    else:
+                        logging.debug("Starting tcpdump")
 
-                output_line = (
-                    f"[{timestamp}] Process: {proc_name_pid}, "
-                    f"Interface: {interface}, State: {state}, "
-                    f"Bytes In: {bytes_in}, Bytes Out: {bytes_out}, "
-                    f"RX Dup: {rx_dupe}, RX OOO: {rx_ooo}, Re-Tx: {re_tx}, "
-                    f"RTT Avg: {rtt_avg}, RcvSize: {rcvsize}, TxWin: {tx_win}"
-                )
-                print(output_line)
-                if self.logfile:
-                    with open(self.logfile, 'a') as f:
-                        f.write(output_line + '\n')
+                    # Build the tcpdump filter expression
+                    port_filters = [f'port {port}' for port in self.active_ports]
+                    filter_expr = ' or '.join(port_filters)
+
+                    tcpdump_cmd = [
+                        'tcpdump',
+                        '-i', 'any',
+                        '-n',
+                        '-l',
+                        '-vv',
+                        filter_expr
+                    ]
+
+                    logging.debug(f"Running tcpdump with filter: {filter_expr}")
+
+                    try:
+                        self.tcpdump_proc = subprocess.Popen(
+                            tcpdump_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            bufsize=1
+                        )
+                    except Exception as e:
+                        logging.error(f"Error starting tcpdump: {e}")
+                        self.running = False
+                        break
+
+            # Read tcpdump output
+            if self.tcpdump_proc and self.tcpdump_proc.stdout:
+                ready, _, _ = select.select([self.tcpdump_proc.stdout], [], [], 1)
+                if ready:
+                    line = self.tcpdump_proc.stdout.readline()
+                    if line:
+                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+                        print(f"[{timestamp}] {line.strip()}")
+                else:
+                    time.sleep(0.1)
             else:
-                logging.debug("Output does not have enough columns. Skipping.")
-        except Exception as e:
-            logging.exception(f"Error processing output: {e}")
+                time.sleep(0.1)
+
+        # Cleanup
+        if self.tcpdump_proc:
+            self.tcpdump_proc.terminate()
+            try:
+                self.tcpdump_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.tcpdump_proc.kill()
 
     def stop(self):
-        logging.debug("Stopping NetTopMonitor...")
+        logging.debug("Stop signal received...")
         self.running = False
 
 def main():
@@ -128,37 +179,23 @@ def main():
     setup_logging(debug=args.debug)
 
     if not is_root():
-        logging.error("This script must be run as root.")
+        logging.error("Script must be run as root")
         sys.exit(1)
 
-    try:
-        import psutil
-        proc = psutil.Process(args.pid)
-        proc_name = get_process_name(proc)
-    except psutil.NoSuchProcess:
-        logging.error(f"Process with PID {args.pid} does not exist.")
-        sys.exit(1)
-    except psutil.AccessDenied:
-        logging.error(f"Access denied to process with PID {args.pid}.")
-        sys.exit(1)
-    except Exception as e:
-        logging.exception(f"Error accessing process with PID {args.pid}: {e}")
-        sys.exit(1)
+    logging.info(f"Monitoring network activity for PID {args.pid} using tcpdump...")
 
-    logging.info(f"Monitoring network activity for PID {args.pid} ({proc_name}) using nettop...")
-
-    nettop_monitor = NetTopMonitor(args.pid, interval=args.interval, logfile=args.logfile)
+    nettop_monitor = NetTopMonitor(args.pid, interval=args.interval)
 
     try:
         nettop_monitor.start()
         while nettop_monitor.running:
             time.sleep(1)
     except KeyboardInterrupt:
-        logging.info("Keyboard interrupt received. Stopping the tool...")
+        logging.info("Keyboard interrupt received")
     finally:
         nettop_monitor.stop()
         nettop_monitor.join()
-        logging.info("Tool stopped.")
+        logging.info("Tool stopped")
 
 if __name__ == '__main__':
     main()

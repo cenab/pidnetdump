@@ -12,11 +12,12 @@ setup(
         'psutil>=5.9.5',
         'scapy>=2.5.0',
         'setuptools>=65.5.0',
+        'processportmonitor>=0.1.7',
     ],
     python_requires='>=3.11',
     entry_points={
         'console_scripts': [
-            'pidnetdump=pidnetdump.pidnetdump:main',
+            'pidnetdump=pidnetdump.run.main:main',
         ],
     },
     classifiers=[

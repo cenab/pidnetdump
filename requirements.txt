@@ -1,0 +1,8 @@
+psutil>=5.9.5
+scapy>=2.5.0
+setuptools>=65.5.0
+processportmonitor>=0.1.7
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.7.0
+flake8>=6.1.0 

@@ -3,3 +3,7 @@ dist/
 *.egg-info/
 net_activity.log
 test_scapy.py
+venv/
+pidnetdump/__pycache__/
+pidnetdump/run/__pycache__/
+tests/__pycache__/
