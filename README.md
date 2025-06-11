@@ -14,7 +14,7 @@ Real-time network packet monitoring for a specific PID.
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/pidnetdump.git
+git clone https://github.com/cenab/pidnetdump.git
 cd pidnetdump
 python3 setup.py install
 ```
